@@ -1,11 +1,15 @@
+using Microsoft.ML.OnnxRuntime;
+using Microsoft.ML.OnnxRuntime.Tensors;
+using OnnxStack.Core;
+using OnnxStack.Core.Config;
+using OnnxStack.Core.Model;
+using SixLabors.ImageSharp.Processing;
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading;
-using Microsoft.ML.OnnxRuntime;
-using Microsoft.ML.OnnxRuntime.Tensors;
-using SixLabors.ImageSharp.Processing;
+using System.Threading.Tasks;
 
 namespace Florence2;
 
@@ -25,43 +29,56 @@ public interface IModelSource
 }
 public class Florence2Model
 {
-    private readonly  SessionOptions         _sessionOptions;
-    private readonly  InferenceSession       _sessionDecoderMerged;
-    private readonly  InferenceSession       _sessionEmbedTokens;
-    private readonly  InferenceSession       _sessionEncoder;
-    private readonly  InferenceSession       _sessionVisionEncoder;
-    internal readonly Florence2Tokenizer     _tokenizer;
-    private readonly  CLIPImageProcessor     _imageProcessor;
-    private readonly  Florence2PostProcessor _postProcessor;
-
+    private readonly SessionOptions _sessionOptions;
+    private readonly OnnxModelSession _sessionEmbedTokens;
+    private readonly OnnxModelSession _sessionVisionEncoder;
+    private readonly OnnxModelSession _sessionEncoder;
+    private readonly OnnxModelSession _sessionDecoderMerged;
+    private readonly Florence2Tokenizer _tokenizer;
+    private readonly CLIPImageProcessor _imageProcessor;
+    private readonly Florence2PostProcessor _postProcessor;
 
     private InferenceSession GetSessionForModel(IModelSource source, IModelSource.Model model)
     {
         return source.TryGetModelPath(model, out var modelPath)
-            ? new InferenceSession(modelPath,                   _sessionOptions)
+            ? new InferenceSession(modelPath, _sessionOptions)
             : new InferenceSession(source.GetModelBytes(model), _sessionOptions);
 
+    }
+
+    private OnnxModelSession GetOnnxStackSessionForModel(IModelSource source, IModelSource.Model model)
+    {
+        source.TryGetModelPath(model, out var modelPath);
+        var onnxConfig = new OnnxModelConfig
+        {
+            DeviceId = 0,
+            ExecutionMode = ExecutionMode.ORT_SEQUENTIAL,
+            ExecutionProvider = ExecutionProvider.Cpu,
+            InterOpNumThreads = 0,
+            IntraOpNumThreads = 0,
+            OnnxModelPath = modelPath
+        };
+        return new OnnxModelSession(onnxConfig);
     }
 
     public Florence2Model(IModelSource modelSource, SessionOptions sessionOptions = null)
     {
         _sessionOptions = sessionOptions ?? new SessionOptions();
-
-        _sessionDecoderMerged = GetSessionForModel(modelSource, IModelSource.Model.DecoderModelMerged);
-        _sessionEmbedTokens   = GetSessionForModel(modelSource, IModelSource.Model.EmbedTokens);
-        _sessionEncoder       = GetSessionForModel(modelSource, IModelSource.Model.EncoderModel);
-        _sessionVisionEncoder = GetSessionForModel(modelSource, IModelSource.Model.VisionEncoder);
+        _sessionDecoderMerged = GetOnnxStackSessionForModel(modelSource, IModelSource.Model.DecoderModelMerged);
+        _sessionEmbedTokens = GetOnnxStackSessionForModel(modelSource, IModelSource.Model.EmbedTokens);
+        _sessionEncoder = GetOnnxStackSessionForModel(modelSource, IModelSource.Model.EncoderModel);
+        _sessionVisionEncoder = GetOnnxStackSessionForModel(modelSource, IModelSource.Model.VisionEncoder);
 
         _tokenizer = Florence2Tokenizer.Init();
 
         _imageProcessor = new CLIPImageProcessor(new CLIPImageProcessor.CLIPConfig()
         {
-            ImageMean      = [0.485f, 0.456f, 0.406f],
+            ImageMean = [0.485f, 0.456f, 0.406f],
             ImageSeqLength = 577,
-            ImageStd       = [0.229f, 0.224f, 0.225f],
-            RescaleFactor  = 0.00392156862745098f,
-            CropHeight     = 768,
-            CropWidth      = 768,
+            ImageStd = [0.229f, 0.224f, 0.225f],
+            RescaleFactor = 0.00392156862745098f,
+            CropHeight = 768,
+            CropWidth = 768,
         }, KnownResamplers.Bicubic);
         _postProcessor = new Florence2PostProcessor();
 
@@ -85,157 +102,181 @@ public class Florence2Model
         }
     }
 
-    public FlorenceResults[] Run(TaskTypes task, Stream imgStream, string textInput, CancellationToken cancellationToken)
+    public async Task<FlorenceResults[]> Run(TaskTypes task, Stream imgStream, string textInput, CancellationToken cancellationToken)
     {
-        using var runOptions = new RunOptions();
-
+        var configuration = new NormalizedConfig();
         var prompts = new string[] { ConstructPrompts(task, textInput) };
-
         var (inputIdsForEncoder, attentionMaskForEncoder) = GetTextInputs(prompts);
-        var (pixelValues, imgSize)                        = _imageProcessor.Preprocess(imgStream);
+        var (pixelValues, imgSize) = _imageProcessor.Preprocess(imgStream);
 
-        using var registration = cancellationToken.Register(() => runOptions.Terminate = true);
 
-        using var text_features = _sessionEmbedTokens.Run(new[] { NamedOnnxValue.CreateFromTensor("input_ids", inputIdsForEncoder), }, new[] { "inputs_embeds" }, runOptions);
-        var       inputsEmbeds  = text_features[0].AsTensor<float>().ToDenseTensor();
+        var sessionEmbedMetadata = await _sessionEmbedTokens.GetMetadataAsync();
+        using (var sessionEmbedParams = new OnnxInferenceParameters(sessionEmbedMetadata))
+        {
+            sessionEmbedParams.AddInputTensor(inputIdsForEncoder);
+            sessionEmbedParams.AddOutputBuffer([inputIdsForEncoder.Dimensions[0], inputIdsForEncoder.Dimensions[1], configuration.DecoderHiddenSize]);
+            var sessionEmbedResult = await _sessionEmbedTokens.RunInferenceAsync(sessionEmbedParams);
+            using (var inputsEmbeds = sessionEmbedResult.First())
+            {
+                pixelValues = TensorExtension.JoinBatches(pixelValues);
 
-        pixelValues = TensorExtension.JoinBatches(pixelValues);
-        using var imageFeaturesResult = _sessionVisionEncoder.Run(new[] { NamedOnnxValue.CreateFromTensor("pixel_values", pixelValues), }, new[] { "image_features" }, runOptions);
-        var       imageFeatures       = imageFeaturesResult[0].AsTensor<float>().ToDenseTensor();
+                var sessionVisionMetadata = await _sessionVisionEncoder.GetMetadataAsync();
+                using (var sessionVisionParams = new OnnxInferenceParameters(sessionVisionMetadata))
+                {
+                    sessionVisionParams.AddInputTensor(pixelValues);
+                    sessionVisionParams.AddOutputBuffer();
+                    var sessionVisionResult = _sessionVisionEncoder.RunInference(sessionVisionParams);
+                    var imageFeatures = sessionVisionResult.First().ToDenseTensor();
 
-        var (inputsEmbedsMerged, attentionMaskMerged) = MergeInputIdsWithImageFeatures(inputsEmbeds, imageFeatures, attentionMaskForEncoder);
+                    var (inputsEmbedsMerged, attentionMaskMerged) = MergeInputIdsWithImageFeatures(inputsEmbeds.ToDenseTensor(), imageFeatures, attentionMaskForEncoder);
 
-        using var forwardOut = _sessionEncoder.Run(new[] { NamedOnnxValue.CreateFromTensor("attention_mask", attentionMaskMerged), NamedOnnxValue.CreateFromTensor("inputs_embeds", inputsEmbedsMerged), }, new[] { "last_hidden_state" }, runOptions);
+                    var sessionEncoderMetadata = await _sessionEncoder.GetMetadataAsync();
+                    using (var sessionEncoderParams = new OnnxInferenceParameters(sessionEncoderMetadata))
+                    {
+                        sessionEncoderParams.AddInputTensor(attentionMaskMerged);
+                        sessionEncoderParams.AddInputTensor(inputsEmbedsMerged);
+                        sessionEncoderParams.AddOutputBuffer(inputsEmbedsMerged.Dimensions);
 
-        var lastHiddenState = forwardOut[0].AsTensor<float>().ToDenseTensor();
+                        var sessionEncoderResult = await _sessionEncoder.RunInferenceAsync(sessionEncoderParams);
+                        using (var lastHiddenState = sessionEncoderResult.First())
+                        {
+                            var result = await GenerationLoop(configuration, attentionMaskMerged, lastHiddenState.ToDenseTensor());
+                            return result.Select(r => _postProcessor.PostProcessGeneration(r, task, imgSize)).ToArray();
+                        }
+                    }
+                }
+            }
+        }
 
-        var encoderOutputs = lastHiddenState;
-
-        var result = GenerationLoop(attentionMaskMerged, encoderOutputs, runOptions);
-
-        return result.Select(r => _postProcessor.PostProcessGeneration(r, task, imgSize)).ToArray();
 
     }
 
-    private List<string> GenerationLoop(DenseTensor<long> attentionMask, DenseTensor<float> encoder_outputs, RunOptions runOptions)
+    private async Task<List<string>> GenerationLoop(NormalizedConfig configuration, DenseTensor<long> attentionMask, DenseTensor<float> encoder_outputs)
     {
-        var batchSize  = 1;
+        var batchSize = 1;
         var batchIndex = 0;
-        var maxLength  = GenerationConfig.MaxLength;
-        var numBeams   = GenerationConfig.NumBeams;
-        var topK       = GenerationConfig.TopK;
+        var maxLength = GenerationConfig.MaxLength;
+        var numBeams = GenerationConfig.NumBeams;
+        var topK = GenerationConfig.TopK;
 
         int noRepeatNgramSize = GenerationConfig.NoRepeatNgramSize;
 
-
         var decoderStartTokenID = _tokenizer.TokenToID(_tokenizer.Tokens.EndOfSequence);
-
-        var          decoderInputIds = TensorExtension.Fill<long>(new[] { batchSize, 1 }, decoderStartTokenID);
-        List<long>[] allInputIds     = Enumerable.Range(0, batchSize).Select(_ => new List<long>(new[] { (long)decoderStartTokenID })).ToArray();
+        var decoderInputIds = TensorExtension.Fill<long>(new[] { batchSize, 1 }, decoderStartTokenID);
+        var allInputIds = Enumerable.Range(0, batchSize).Select(_ => new List<long>([decoderStartTokenID])).ToArray();
 
 
         var results = new List<string>();
-
-        NamedOnnxValue[] pastKeyValues = null;
-
-
-        var logitsProcessors = new List<LogitsProcessor>();
-
-        logitsProcessors.Add(new NoRepeatNGramLogitsProcessor(noRepeatNgramSize));
-        logitsProcessors.Add(new ForcedBOSTokenLogitsProcessor(_tokenizer.TokenToID(_tokenizer.Tokens.BeginningOfSequence)));
-        logitsProcessors.Add(new ForcedEOSTokenLogitsProcessor(maxLength, _tokenizer.TokenToID(_tokenizer.Tokens.EndOfSequence)));
+        var pastKeyValues = default(DenseTensor<float>[]);
 
         var sampler = new BeamSearchSampler(TensorOperationRegistry.TopKSession(_sessionOptions), topK: topK, numBeams: numBeams);
 
+        var logitsProcessors = new List<LogitsProcessor>
+        {
+            new NoRepeatNGramLogitsProcessor(noRepeatNgramSize),
+            new ForcedBOSTokenLogitsProcessor(_tokenizer.TokenToID(_tokenizer.Tokens.BeginningOfSequence)),
+            new ForcedEOSTokenLogitsProcessor(maxLength, _tokenizer.TokenToID(_tokenizer.Tokens.EndOfSequence))
+        };
 
-        var stoppingCriteria = new List<StoppingCriteria>();
-        stoppingCriteria.Add(new MaxLengthCriteria(maxLength));
-        stoppingCriteria.Add(new EosTokenCriteria(_tokenizer.TokenToID(_tokenizer.Tokens.EndOfSequence)));
+        var stoppingCriteria = new List<StoppingCriteria>
+        {
+            new MaxLengthCriteria(maxLength),
+            new EosTokenCriteria(_tokenizer.TokenToID(_tokenizer.Tokens.EndOfSequence))
+        };
+
 
         var decoder = new ByteLevelDecoder(_tokenizer.AddedTokens);
-
 
         double[] scores = new double[batchSize];
 
         while (true)
         {
-            using var decoderInputsEmbeds = _sessionEmbedTokens.Run(new[] { NamedOnnxValue.CreateFromTensor("input_ids", decoderInputIds), }, new[] { "inputs_embeds" }, runOptions); // inputIds -> input_embeds
-
-
-            var useCacheBranche = pastKeyValues is object;
-            var useCacheBranch  = new DenseTensor<bool>(new[] { useCacheBranche }, dimensions: new[] { 1 });
-
-            var decoderInputsEmbedsVec = decoderInputsEmbeds[0].AsTensor<float>().ToDenseTensor();
-
-            var decoderFeeds = new[]
+            var sessionEmbedMetadata = await _sessionEmbedTokens.GetMetadataAsync();
+            using (var sessionEmbedParams = new OnnxInferenceParameters(sessionEmbedMetadata))
             {
-                NamedOnnxValue.CreateFromTensor("inputs_embeds",          decoderInputsEmbedsVec),
-                NamedOnnxValue.CreateFromTensor("encoder_attention_mask", attentionMask),
-                NamedOnnxValue.CreateFromTensor("encoder_hidden_states",  encoder_outputs),
-                NamedOnnxValue.CreateFromTensor("use_cache_branch",       useCacheBranch),
-            };
+                sessionEmbedParams.AddInputTensor(decoderInputIds);
+                sessionEmbedParams.AddOutputBuffer([1, 1, configuration.EncoderHiddenSize]);
 
-            pastKeyValues ??= InitPastKeyValues(new NormalizedConfig()).ToArray();
-
-            if (pastKeyValues is object)
-            {
-                decoderFeeds = decoderFeeds.Concat(pastKeyValues).ToArray();
-            }
-            using var decoder_out = _sessionDecoderMerged.Run(decoderFeeds, new[] { "logits", "present.0.decoder.key", "present.0.decoder.value", "present.0.encoder.key", "present.0.encoder.value", "present.1.decoder.key", "present.1.decoder.value", "present.1.encoder.key", "present.1.encoder.value", "present.2.decoder.key", "present.2.decoder.value", "present.2.encoder.key", "present.2.encoder.value", "present.3.decoder.key", "present.3.decoder.value", "present.3.encoder.key", "present.3.encoder.value", "present.4.decoder.key", "present.4.decoder.value", "present.4.encoder.key", "present.4.encoder.value", "present.5.decoder.key", "present.5.decoder.value", "present.5.encoder.key", "present.5.encoder.value" }, runOptions);
-
-            pastKeyValues = FromPresent(decoder_out, useCacheBranche, pastKeyValues).ToArray();
-
-            var logits = decoder_out.First(t => t.Name == "logits");
-
-            var logitsTensor = logits.AsTensor<float>().ToDenseTensor();
-
-            var logitsTensorProcessed = new DenseTensor<float>(new Memory<float>(logitsTensor.ToArray()), new[] { logitsTensor.Dimensions[0], logitsTensor.Dimensions[2] }, logitsTensor.IsReversedStride);
-
-            foreach (var logitsProcessor in logitsProcessors)
-            {
-                logitsProcessor.Process(batchIndex, allInputIds[batchIndex].ToArray(), logitsTensorProcessed);
-            }
-
-            var sampledTokens = sampler.Sample(batchIndex, logitsTensorProcessed);
-
-            var generatedInputIds = new List<long>[batchSize];
-
-
-            foreach (var (token, score) in sampledTokens)
-            {
-                scores[batchIndex] += score;
-                var batchAllInputIds = allInputIds[batchIndex] ?? new List<long>();
-                batchAllInputIds.Add(token);
-                allInputIds[batchIndex] = batchAllInputIds;
-
-                var batchgeneratedInputIds = generatedInputIds[batchIndex] ?? new List<long>();
-                batchgeneratedInputIds.Add(token);
-                generatedInputIds[batchIndex] = batchgeneratedInputIds;
-                // TODO: Support beam search or just remove this
-                break;
-            }
-
-
-            var isDone = new bool[batchSize];
-
-            foreach (var stoppingCriterion in stoppingCriteria)
-            {
-                var criterionDone = stoppingCriterion.Call(allInputIds, scores);
-
-                for (var i = 0; i < isDone.Length; ++i)
+                var sessionEmbedResult = await _sessionEmbedTokens.RunInferenceAsync(sessionEmbedParams);
+                using (var decoderInputsEmbeds = sessionEmbedResult.First())
                 {
-                    isDone[i] = isDone[i] || criterionDone[i];
-                }
-            }
+                    var useCacheBranche = pastKeyValues is not null;
+                    var useCacheBranch = new DenseTensor<bool>(new[] { useCacheBranche }, [1]);
 
-            if (isDone.All(e => e))
-            {
-                results.AddRange(allInputIds.Select(allInputId => DecodeSingle(_tokenizer, decoder, allInputId.Select(Convert.ToInt32).ToArray())));
-                break;
-            }
-            else
-            {
-                decoderInputIds = new DenseTensor<long>(generatedInputIds.SelectMany(ids => ids).ToArray(), dimensions: new int[] { generatedInputIds.Length, 1 });
+                    var sessionDecoderMergedMetadata = await _sessionDecoderMerged.GetMetadataAsync();
+                    using (var sessionDecoderMergedParams = new OnnxInferenceParameters(sessionDecoderMergedMetadata))
+                    {
+                        sessionDecoderMergedParams.AddInputTensor(attentionMask);
+                        sessionDecoderMergedParams.AddInputTensor(encoder_outputs);
+                        sessionDecoderMergedParams.AddInput(decoderInputsEmbeds);
+
+                        pastKeyValues ??= InitPastKeyValues(configuration);
+                        foreach (var pastKeyValue in pastKeyValues)
+                            sessionDecoderMergedParams.AddInputTensor(pastKeyValue);
+
+                        sessionDecoderMergedParams.AddInputTensor(useCacheBranch);
+
+                        foreach (var output in sessionDecoderMergedMetadata.Outputs)
+                            sessionDecoderMergedParams.AddOutputBuffer();
+
+
+                        using (var sessionDecoderMergedResult = _sessionDecoderMerged.RunInference(sessionDecoderMergedParams))
+                        {
+                            FromPresent(sessionDecoderMergedResult, pastKeyValues, useCacheBranche);
+
+                            var logitsTensor = sessionDecoderMergedResult[0].ToDenseTensor();
+                            var logitsTensorProcessed = logitsTensor.Reshape([logitsTensor.Dimensions[0], logitsTensor.Dimensions[2]]).ToDenseTensor();
+
+                            foreach (var logitsProcessor in logitsProcessors)
+                            {
+                                logitsProcessor.Process(batchIndex, allInputIds[batchIndex].ToArray(), logitsTensorProcessed);
+                            }
+
+                            var sampledTokens = sampler.Sample(batchIndex, logitsTensorProcessed);
+
+                            var generatedInputIds = new List<long>[batchSize];
+
+
+                            foreach (var (token, score) in sampledTokens)
+                            {
+                                scores[batchIndex] += score;
+                                var batchAllInputIds = allInputIds[batchIndex] ?? new List<long>();
+                                batchAllInputIds.Add(token);
+                                allInputIds[batchIndex] = batchAllInputIds;
+
+                                var batchgeneratedInputIds = generatedInputIds[batchIndex] ?? new List<long>();
+                                batchgeneratedInputIds.Add(token);
+                                generatedInputIds[batchIndex] = batchgeneratedInputIds;
+                                // TODO: Support beam search or just remove this
+                                break;
+                            }
+
+
+                            var isDone = new bool[batchSize];
+
+                            foreach (var stoppingCriterion in stoppingCriteria)
+                            {
+                                var criterionDone = stoppingCriterion.Call(allInputIds, scores);
+
+                                for (var i = 0; i < isDone.Length; ++i)
+                                {
+                                    isDone[i] = isDone[i] || criterionDone[i];
+                                }
+                            }
+
+                            if (isDone.All(e => e))
+                            {
+                                results.AddRange(allInputIds.Select(allInputId => DecodeSingle(_tokenizer, decoder, allInputId.Select(Convert.ToInt32).ToArray())));
+                                break;
+                            }
+                            else
+                            {
+                                decoderInputIds = new DenseTensor<long>(generatedInputIds.SelectMany(ids => ids).ToArray(), [generatedInputIds.Length, 1]);
+                            }
+                        }
+
+                    }
+                }
             }
         }
 
@@ -251,10 +292,10 @@ public class Florence2Model
 
         var tokenCount = encoded.First().InputIds.Length;
 
-        var inputIds             = new long[encoded.Sum(s => s.InputIds.Length)];
+        var inputIds = new long[encoded.Sum(s => s.InputIds.Length)];
         var flattenAttentionMask = new long[encoded.Sum(s => s.AttentionMask.Length)];
 
-        var flattenInputIDsSpan      = inputIds.AsSpan();
+        var flattenInputIDsSpan = inputIds.AsSpan();
         var flattenAttentionMaskSpan = flattenAttentionMask.AsSpan();
 
         foreach (var (InputIds, AttentionMask) in encoded)
@@ -275,7 +316,7 @@ public class Florence2Model
     private static (DenseTensor<float> inputs_embeds, DenseTensor<long> attentionMask) MergeInputIdsWithImageFeatures(
         DenseTensor<float> inputsEmbeds,
         DenseTensor<float> imageFeatures,
-        DenseTensor<long>  attentionMask
+        DenseTensor<long> attentionMask
     )
     {
         return (
@@ -304,63 +345,67 @@ public class Florence2Model
         // Clean up a list of simple English tokenization artifacts
         // like spaces before punctuations and abbreviated forms
         return text.Replace(" .", ".")
-           .Replace(" ?",   "?")
-           .Replace(" !",   "!")
-           .Replace(" ,",   ",")
-           .Replace(" ' ",  "")
+           .Replace(" ?", "?")
+           .Replace(" !", "!")
+           .Replace(" ,", ",")
+           .Replace(" ' ", "")
            .Replace(" n't", "n't")
-           .Replace(" 'm",  "'m")
-           .Replace(" 's",  "'s")
+           .Replace(" 'm", "'m")
+           .Replace(" 's", "'s")
            .Replace(" 've", "'ve")
            .Replace(" 're", "'re");
     }
 
 
-    private IEnumerable<NamedOnnxValue> FromPresent(IDisposableReadOnlyCollection<DisposableNamedOnnxValue> decoderOut, bool useCache, NamedOnnxValue[]? pastKeyValues)
-    {
-        foreach (var decoderOutput in decoderOut)
-        {
-            if (decoderOutput.Name.StartsWith("present"))
-            {
-                var newName = decoderOutput.Name.Replace("present", "past_key_values");
 
-                if (useCache && decoderOutput.Name.Contains("encoder"))
+
+
+
+
+    private void FromPresent(IDisposableReadOnlyCollection<OrtValue> decoderOutput, DenseTensor<float>[] pastKeyValues, bool useCache)
+    {
+        var presentOutputs = decoderOutput.Select(x => x.ToDenseTensor()).ToArray()[1..];
+        for (int i = 0; i < presentOutputs.Length; i++)
+        {
+            if (i % 4 == 0)
+            {
+                pastKeyValues[i] = presentOutputs[i].ToDenseTensor();
+                pastKeyValues[i + 1] = presentOutputs[i + 1].ToDenseTensor();
+                if (!useCache)
                 {
-                    //use cache
-                    var vec = pastKeyValues.First(e => e.Name == newName).Value as DenseTensor<float>;
-                    if (vec is null) throw new InvalidOperationException();
-                    yield return NamedOnnxValue.CreateFromTensor(newName, vec.Clone());
-                }
-                else
-                {
-                    var vec = decoderOutput.Value as DenseTensor<float>;
-                    if (vec is null) throw new InvalidOperationException();
-                    yield return NamedOnnxValue.CreateFromTensor(newName, vec.Clone());
+                    pastKeyValues[i + 2] = presentOutputs[i + 2].ToDenseTensor();
+                    pastKeyValues[i + 3] = presentOutputs[i + 3].ToDenseTensor();
                 }
             }
         }
     }
 
-    private IEnumerable<NamedOnnxValue> InitPastKeyValues(NormalizedConfig normalizedConfig)
+
+
+    private DenseTensor<float>[] InitPastKeyValues(NormalizedConfig normalizedConfig)
     {
-        var prefix    = "past_key_values";
         var batchSize = 1;
+        var output = new DenseTensor<float>[normalizedConfig.NumDecoderLayers * 4];
 
         var encoderDimKv = normalizedConfig.EncoderHiddenSize / normalizedConfig.NumEncoderHeads;
-
         var decoderDimKv = normalizedConfig.DecoderHiddenSize / normalizedConfig.NumDecoderHeads;
 
         var encoderDims = new[] { batchSize, normalizedConfig.NumDecoderHeads, 0, encoderDimKv };
         var decoderDims = new[] { batchSize, normalizedConfig.NumDecoderHeads, 0, decoderDimKv };
 
-        for (var i = 0; i < normalizedConfig.NumDecoderLayers; ++i)
+        for (var i = 0; i < output.Length; ++i)
         {
-            yield return NamedOnnxValue.CreateFromTensor($"{prefix}.{i}.encoder.key",   new DenseTensor<float>(encoderDims));
-            yield return NamedOnnxValue.CreateFromTensor($"{prefix}.{i}.encoder.value", new DenseTensor<float>(encoderDims));
-            yield return NamedOnnxValue.CreateFromTensor($"{prefix}.{i}.decoder.key",   new DenseTensor<float>(decoderDims));
-            yield return NamedOnnxValue.CreateFromTensor($"{prefix}.{i}.decoder.value", new DenseTensor<float>(decoderDims));
+            if (i % 4 == 0)
+            {
+                output[i] = new DenseTensor<float>(decoderDims);
+                output[i + 1] = new DenseTensor<float>(decoderDims);
+                output[i + 2] = new DenseTensor<float>(encoderDims);
+                output[i + 3] = new DenseTensor<float>(encoderDims);
+            }
         }
+        return output;
     }
+
 
     public static Dictionary<TaskTypes, string> TaskPromptsWithoutInputsDict = new Dictionary<TaskTypes, string>
     {
