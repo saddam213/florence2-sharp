@@ -130,7 +130,7 @@ public class Florence2Model
 
         var decoderStartTokenID = _tokenizer.TokenToID(_tokenizer.Tokens.EndOfSequence);
 
-        var          decoderInputIds = TensorExtension.OnesLong(new[] { batchSize, 1 }, decoderStartTokenID);
+        var          decoderInputIds = TensorExtension.Fill<long>(new[] { batchSize, 1 }, decoderStartTokenID);
         List<long>[] allInputIds     = Enumerable.Range(0, batchSize).Select(_ => new List<long>(new[] { (long)decoderStartTokenID })).ToArray();
 
 
@@ -284,7 +284,7 @@ public class Florence2Model
                 inputsEmbeds, // task prefix embeds
                 axis: 1),
             attentionMask: TensorExtension.ConcatTensor(
-                TensorExtension.OnesLong(imageFeatures.Dimensions.Slice(0, 2)), // image attention mask
+                TensorExtension.Ones<long>(imageFeatures.Dimensions.Slice(0, 2)), // image attention mask
                 attentionMask, // task prefix attention mask
                 axis: 1));
     }
